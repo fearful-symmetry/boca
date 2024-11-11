@@ -4,10 +4,10 @@ use anyhow::Context;
 use axum::{extract::State, http::StatusCode, response::{sse::Event, Html, IntoResponse, Sse}, routing::get, Router};
 use html::generate;
 use markdown::Options;
-use notify::{event::{DataChange, MetadataKind, ModifyKind}, EventKind, RecommendedWatcher, Watcher};
+use notify::{ PollWatcher, Watcher};
 use serde::Serialize;
 use tokio::sync::mpsc::{channel, unbounded_channel, Sender};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tracing::{debug, error, info};
@@ -92,7 +92,14 @@ async fn sse_handler(State(state): State<Cli>, axum::extract::Path(path): axum::
     
     let filestream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-    Sse::new(filestream).keep_alive(
+    // I'm sure there's a better way to log this...
+    Sse::new(filestream.map(|msg|{
+        match &msg {
+            Ok(_e) =>  tracing::trace!("got update event from file watcher"),
+            Err(e) => error!("error in filestream event from watcher: {:?}", e)
+        };
+        msg
+    })).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(Duration::from_secs(1))
             .text("keep-alive-text"),
@@ -122,22 +129,24 @@ async fn file_watch(tx: Sender<Result<Event, anyhow::Error>>, opts: Cli) -> anyh
     let (watch_tx,mut watch_rx) = unbounded_channel::<Result<notify::Event, notify::Error>>();
     
     
-    let mut watcher = RecommendedWatcher::new(
+    let mut watcher = PollWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
+                tracing::trace!("got event of type {:?}", res);
                 if let Err(e) = watch_tx.send(res) {
                     error!("error sending from watcher, exiting handler: {}", e);
                 }
         },
-        notify::Config::default(),
+        notify::Config::default().with_poll_interval(Duration::from_secs(1)),
     )?;
 
     let path = Path::new(&opts.filename);
     watcher.watch(path, notify::RecursiveMode::Recursive)?;
+
+
     while let Some(evt) = watch_rx.recv().await {
-        tracing::trace!("got event of type {:?}", evt);
+        
         let file_evt = evt?;
-        if EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)) == file_evt.kind ||
-        EventKind::Modify(ModifyKind::Data(DataChange::Any)) == file_evt.kind {
+        if file_evt.kind.is_modify() {
             let path = file_evt.paths[0].clone();
             let monitor_path = path.to_string_lossy().to_string();
             debug!{%monitor_path, "updating file"};
