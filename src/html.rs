@@ -20,7 +20,7 @@ pub fn generate(config: Cli) -> anyhow::Result<String> {
                         justify-content: center;
                     }
                     .text-body {
-                        max-width: 60%;
+                        max-width: 40%;
                     }
                     pre {
                         page-break-inside: avoid;

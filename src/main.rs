@@ -1,18 +1,19 @@
 use std::{fs::read_to_string, path::Path, time::Duration};
 
-use anyhow::Context;
+use anyhow::anyhow;
 use axum::{extract::State, http::StatusCode, response::{sse::Event, Html, IntoResponse, Sse}, routing::get, Router};
 use html::generate;
 use markdown::Options;
-use notify::{ PollWatcher, Watcher};
+use notify::{ EventHandler, Watcher};
 use serde::Serialize;
 use tokio::sync::mpsc::{channel, unbounded_channel, Sender};
 use tokio_stream::{Stream, StreamExt};
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, span, Instrument, Level};
 
 mod html;
+
 
 /// The Cli. Implements Serialize so we can send it right to the templating engine that renders HTML
 #[derive(Clone, Parser, Serialize)]
@@ -34,22 +35,45 @@ struct Cli {
     #[arg(long)]
     dark: bool,
 
-    /// Enable debug-level logging.
+    /// Enable debug-level logging. Supply twice for trace logging.
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
+
+    /// Use an inotify watcher instead of a polling watcher
+    #[arg(short, long)]
+    inotify: bool,
+
+    /// Render unsafe HTML in markdown. Only use for trusted files
+    #[arg(long)]
+    html: bool,
+}
+
+impl Cli {
+    /// wrapper to allow us to easily swap between the inotify and poll watcher
+    fn poller<F: EventHandler>(&self, cb: F, cfg: notify::Config) -> anyhow::Result<Box<dyn notify::Watcher + Send>> {
+        if self.inotify {
+            debug!("Using inotify watcher");
+            Ok(Box::new(notify::INotifyWatcher::new(cb, cfg)?))
+        } else {
+            debug!("Using poll watcher");
+            Ok(Box::new(notify::PollWatcher::new(cb, cfg)?))
+        }
+    } 
+
+    fn logging(&self) -> String {
+        match self.debug {
+            0 => String::from("info"),
+            1 => String::from("debug"),
+            _ => String::from("trace")
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let trace_level = if cli.debug == 0 {
-        "info"
-    } else if cli.debug == 1 {
-        "debug"
-    } else {
-        "trace"
-    };
+    let trace_level = cli.logging();
     tracing_subscriber::registry()
     .with(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -69,9 +93,7 @@ async fn main() -> anyhow::Result<()> {
     .with_state(cli.clone());
 
     let listener = tokio::net::TcpListener::bind(cli.address).await?;
-
     info!("serving on {}", listener.local_addr()?);
-
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -80,15 +102,16 @@ async fn main() -> anyhow::Result<()> {
 /// handler for /sse
 async fn sse_handler(State(state): State<Cli>, axum::extract::Path(path): axum::extract::Path<String>) 
 -> Sse<impl Stream<Item = Result<Event, anyhow::Error>>> {
-    let newstate = Cli{filename: path, ..state};
-    debug!{%newstate.filename, "starting new SSE handler"};
+    let newstate = Cli{filename: path.clone(), ..state};
     let (tx, rx) = channel::<Result<Event, anyhow::Error>>(30);
 
+    let fspan = span!(Level::DEBUG, "file_watch", file=&path);
     tokio::spawn(async move {
+        debug!("starting new SSE handler");
        if let Err(e) = file_watch(tx, newstate).await {
         error!("error watching file, closing SSE task: {}", e);
        }
-    });
+    }.instrument(fspan));
     
     let filestream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
@@ -122,14 +145,14 @@ async fn root(State(state): State<Cli>) -> Result<Html<String>, BocaError> {
 
 /// blocks until the receiver closes, waits and sends file updates
 async fn file_watch(tx: Sender<Result<Event, anyhow::Error>>, opts: Cli) -> anyhow::Result<()> {
-    debug!{%opts.filename, "starting new file notify watcher"};
+    debug!("starting new file notify watcher");
     //initialize with base file event
-    tx.send(read_to_event(&opts.filename)).await?;
+    tx.send(read_to_event(&opts.filename, opts.html).await).await?;
 
     let (watch_tx,mut watch_rx) = unbounded_channel::<Result<notify::Event, notify::Error>>();
     
     
-    let mut watcher = PollWatcher::new(
+    let mut watcher = opts.poller(
         move |res: Result<notify::Event, notify::Error>| {
                 tracing::trace!("got event of type {:?}", res);
                 if let Err(e) = watch_tx.send(res) {
@@ -150,7 +173,7 @@ async fn file_watch(tx: Sender<Result<Event, anyhow::Error>>, opts: Cli) -> anyh
             let path = file_evt.paths[0].clone();
             let monitor_path = path.to_string_lossy().to_string();
             debug!{%monitor_path, "updating file"};
-            tx.send(read_to_event(path)).await?;
+            tx.send(read_to_event(path, opts.html).await).await?;
         }
 
     }
@@ -158,9 +181,15 @@ async fn file_watch(tx: Sender<Result<Event, anyhow::Error>>, opts: Cli) -> anyh
 }
 
 /// turn a filepath into a complete SSE event from parsed markdown
-fn read_to_event<P: AsRef<Path>>(filepath: P) -> Result<Event, anyhow::Error>{
-    let md = read_to_string(&filepath).context(format!("error reading path {}", filepath.as_ref().to_string_lossy()))?;
-    let res_html = match markdown::to_html_with_options(&md, &Options::gfm()){
+async fn read_to_event<P: AsRef<Path>>(filepath: P, html_mode: bool) -> Result<Event, anyhow::Error>{
+    let md = retry_read(&filepath).await?;
+    let mut md_opts = Options::gfm();
+    if html_mode {
+        md_opts.compile.allow_dangerous_html = true;
+        md_opts.compile.allow_dangerous_protocol = true;
+        md_opts.compile.gfm_tagfilter = false;
+    }
+    let res_html = match markdown::to_html_with_options(&md, &md_opts){
         Ok(h) => h,
         Err(m) => {
             error!{%m.source, %m.reason, "error rendering markdown"}
@@ -169,6 +198,24 @@ fn read_to_event<P: AsRef<Path>>(filepath: P) -> Result<Event, anyhow::Error>{
     };
     Ok(Event::default().data(res_html).event("body"))
 
+}
+
+/// The MOVE_SELF behavior of vim tends to produce race conditions, we might try to read a file while vim is moving things around.
+async fn retry_read<P: AsRef<Path>>(filepath: P) -> anyhow::Result<String> {
+    let count = 3;
+    for _i in 0..count {
+        match read_to_string(&filepath) {
+            Ok(r) => {
+                return Ok(r)
+            }
+            Err(e) => {
+                error!("error reading file, retrying: {e}");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await
+    };
+
+    Err(anyhow!("Could not read from file {}", filepath.as_ref().to_string_lossy()))
 }
 
 struct BocaError(anyhow::Error);
